@@ -1,7 +1,6 @@
 #=
 Implementation copied from here (Jonas Steinebach, MIT):
 https://github.com/jonas208/GradValley.jl/blob/main/src/functional/gv_convolution.jl
-Almost certainly wrong due to Conv / CrossCorr conventions.
 Could include bias & activation too, hence overload `conv_bias_act`,
 at the cost of needing gradient rules for that.
 =#
@@ -16,7 +15,7 @@ function zero_pad_2d(input::AbstractArray{T, 4}, padding::NTuple{4, Int}) where 
     return output
 end
 
-function NNlib.conv!(output::Array{T,4}, input::Array{T,4}, weight::Array{T,4}, cdims::ConvDims; kw...) where {T<:Float32}
+function NNlib.conv!(output::Array{T,4}, input::Array{T,4}, weight::Array{T,4}, cdims::ConvDims; kw...) where {T<:Real}
 
     if cdims.padding != (0, 0, 0, 0)
         #=
@@ -30,6 +29,10 @@ function NNlib.conv!(output::Array{T,4}, input::Array{T,4}, weight::Array{T,4}, 
     output_width, output_height, _ = size(output)
     input_width, input_height, in_channels, batches = size(input)
     weight_width, weight_height, in_channels_weight, out_channels = size(weight)
+
+    if !NNlib.flipkernel(cdims)
+        weight = reverse(weight, dims=(1, 2))
+    end
 
     groups = cdims.groupcount
     x_stride, y_stride = cdims.stride
@@ -89,7 +92,7 @@ function NNlib.conv!(output::Array{T,4}, input::Array{T,4}, weight::Array{T,4}, 
     return output
 end
 
-function NNlib.∇conv_data!(input_gradient::Array{T,4}, output_gradient::Array{T,4}, weight::Array{T,4}, cdims::ConvDims; kw...) where {T<:Float32}
+function NNlib.∇conv_data!(input_gradient::Array{T,4}, output_gradient::Array{T,4}, weight::Array{T,4}, cdims::ConvDims; kw...) where {T<:Real}
     # storing all the necessary shapes
     output_width, output_height, out_channels, current_batch_size = size(output_gradient)
     weight_width, weight_height, in_channels_weight, out_channels = size(weight)
@@ -102,17 +105,21 @@ function NNlib.∇conv_data!(input_gradient::Array{T,4}, output_gradient::Array{
         input_gradient_padded = input_gradient
     end
     # store the size of input after padding 
-    input_width, input_height, in_channels, current_batch_size = size(input_gradient_padded) # size after padding 
+    input_width, input_height, in_channels, current_batch_size = size(input_gradient_padded) # size after padding
+
+    if !NNlib.flipkernel(cdims)
+        weight = reverse(weight, dims=(1, 2))
+    end
 
     groups = cdims.groupcount
     x_stride, y_stride = cdims.stride
     x_dilation, y_dilation = cdims.dilation
     out_channels_per_group = out_channels ÷ groups
     # actual computation
-    if groups == 1 && stride == (1, 1) && dilation == (1, 1) # very specialized case for maximum performance
+    if groups == 1 && cdims.stride == (1, 1) && cdims.dilation == (1, 1) # very specialized case for maximum performance
         # println("very specialized case for maximum performance")
-        @tturbo for index_batch in 1:current_batch_size
-            for out_channel in 1:out_channels, y_out in 1:output_height, x_out in 1:output_width
+        Threads.@threads for index_batch in 1:current_batch_size
+            @turbo for out_channel in 1:out_channels, y_out in 1:output_height, x_out in 1:output_width
                 for in_channel in 1:in_channels, y_w in 1:weight_height, x_w in 1:weight_width
                     input_gradient_padded[x_out + x_w - 1, y_out + y_w - 1, in_channel, index_batch] += weight[x_w, y_w, in_channel, out_channel] * output_gradient[x_out, y_out, out_channel, index_batch]
                 end
@@ -120,8 +127,8 @@ function NNlib.∇conv_data!(input_gradient::Array{T,4}, output_gradient::Array{
         end
     elseif groups == 1 # second specialized case for better performance
         # println("second specialized case for better performance")
-        @tturbo for index_batch in 1:current_batch_size
-            for out_channel in 1:out_channels, y_out in 1:output_height, x_out in 1:output_width
+        Threads.@threads for index_batch in 1:current_batch_size
+            @turbo for out_channel in 1:out_channels, y_out in 1:output_height, x_out in 1:output_width
                 m = y_out + (y_stride - 1) * (y_out - 1)
                 n = x_out + (x_stride - 1) * (x_out - 1)
                 for in_channel in 1:in_channels, y_w in 1:weight_height, x_w in 1:weight_width
@@ -133,8 +140,8 @@ function NNlib.∇conv_data!(input_gradient::Array{T,4}, output_gradient::Array{
         end
     else # general case for any convolution 
         # println("general case for any convolution")
-        @tturbo for index_batch in 1:current_batch_size
-            for out_channel_per_group in 1:out_channels_per_group 
+        Threads.@threads for index_batch in 1:current_batch_size
+            @turbo for out_channel_per_group in 1:out_channels_per_group 
                 for group in 1:groups, y_out in 1:output_height, x_out in 1:output_width
                     m = y_out + (y_stride - 1) * (y_out - 1)
                     n = x_out + (x_stride - 1) * (x_out - 1)
@@ -152,9 +159,79 @@ function NNlib.∇conv_data!(input_gradient::Array{T,4}, output_gradient::Array{
 
     # depad 
     if cdims.padding != (0, 0, 0, 0)
-        y_pad, x_pad = padding
-        input_gradient .= input_gradient_padded[x_pad+1:input_width-x_pad, y_pad+1:input_height-y_pad, :, :]
+        x_pad1, x_pad2, y_pad1, y_pad2 = cdims.padding
+        input_gradient .= input_gradient_padded[x_pad1+1:input_width-x_pad2, y_pad1+1:input_height-y_pad2, :, :]
     end
 
     return input_gradient
+end
+
+function NNlib.∇conv_filter!(weight_gradient::Array{T,4}, input::Array{T,4}, output_gradient::Array{T,4}, cdims::ConvDims; kw...) where {T<:Real}
+    # storing all the necessary shapes
+    input_width, input_height, in_channels, current_batch_size = size(input)
+    output_width, output_height, out_channels, current_batch_size = size(output_gradient)
+    weight_width, weight_height, in_channels_weight, out_channels = size(weight_gradient)
+
+    # check if input must be padded 
+    if cdims.padding != (0, 0, 0, 0)
+        input_padded = zero_pad_2d(input, cdims.padding)
+    else
+        input_padded = input
+    end
+
+    groups = cdims.groupcount
+    x_stride, y_stride = cdims.stride
+    x_dilation, y_dilation = cdims.dilation
+    out_channels_per_group = out_channels ÷ groups
+    # actual computation 
+    if groups == 1 && cdims.stride == (1, 1) && cdims.dilation == (1, 1) # very specialized case for maximum performance
+        # println("very specialized case for maximum performance")
+        @tturbo for out_channel in 1:out_channels
+            for in_channel in 1:in_channels, y_w in 1:weight_height, x_w in 1:weight_width
+                value = zero(T)
+                for index_batch in 1:current_batch_size, y_out in 1:output_height, x_out in 1:output_width
+                    value += input_padded[x_out + x_w - 1, y_out + y_w - 1, in_channel, index_batch] * output_gradient[x_out, y_out, out_channel, index_batch]
+                end
+                weight_gradient[x_w, y_w, in_channel, out_channel] = value
+            end
+        end
+    elseif groups == 1 # second specialized case for better performance
+        # println("second specialized case for better performance")
+        @tturbo for out_channel in 1:out_channels
+            for in_channel in 1:in_channels, y_w in 1:weight_height, x_w in 1:weight_width
+                value = zero(T)
+                for index_batch in 1:current_batch_size, y_out in 1:output_height, x_out in 1:output_width
+                    m = y_out + (y_stride - 1) * (y_out - 1)
+                    n = x_out + (x_stride - 1) * (x_out - 1)
+                    y_in = m + (y_w - 1) * y_dilation
+                    x_in = n + (x_w - 1) * x_dilation
+                    value += input_padded[x_in, y_in, in_channel, index_batch] * output_gradient[x_out, y_out, out_channel, index_batch]
+                end
+                weight_gradient[x_w, y_w, in_channel, out_channel] = value
+            end
+        end
+    else # general case for any convolution 
+        # println("general case for any convolution")
+        @tturbo for out_channel_per_group in 1:out_channels_per_group
+            for group in 1:groups, in_channel_weight in 1:in_channels_weight, y_w in 1:weight_height, x_w in 1:weight_width
+                value = zero(T)
+                for index_batch in 1:current_batch_size, y_out in 1:output_height, x_out in 1:output_width
+                    m = y_out + (y_stride - 1) * (y_out - 1)
+                    n = x_out + (x_stride - 1) * (x_out - 1)
+                    out_channel = (group * out_channels_per_group + 1) - out_channel_per_group
+                    y_in = m + (y_w - 1) * y_dilation
+                    x_in = n + (x_w - 1) * x_dilation
+                    in_channel_input = in_channel_weight + (group - 1) * in_channels_weight
+                    value += input_padded[x_in, y_in, in_channel_input, index_batch] * output_gradient[x_out, y_out, out_channel, index_batch]
+                end
+                weight_gradient[x_w, y_w, in_channel_weight, out_channel] = value
+            end
+        end
+    end
+
+    if !NNlib.flipkernel(cdims)
+        weight_gradient = reverse(weight_gradient, dims=(1, 2))
+    end
+    
+    return weight_gradient
 end
